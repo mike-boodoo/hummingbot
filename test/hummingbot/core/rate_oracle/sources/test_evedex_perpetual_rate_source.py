@@ -14,6 +14,11 @@ class EvedexPerpetualRateSourceTest(IsolatedAsyncioWrapperTestCase):
         cls.global_token = "USDT"
         cls.trading_pair = combine_to_hb_trading_pair(base=cls.target_token, quote=cls.global_token)
 
+    def setUp(self):
+        super().setUp()
+        # get_prices is cached by repr(self), so a new instance reusing a freed address could get a stale result
+        EvedexPerpetualRateSource.get_prices.cache_clear()
+
     def _get_mock_exchange(self, expected_rate: Decimal):
         mock_exchange = MagicMock()
 
