@@ -252,7 +252,10 @@ class XRPLTransactionPipeline:
                     self._submissions_failed += 1
 
                     if not future.done():
-                        future.set_exception(e)
+                        # Drop this loop's frame from the traceback: the caller would otherwise hold a
+                        # reference to the suspended loop frame, and clearing it (e.g. traceback.clear_frames)
+                        # closes the loop coroutine, leaving the pipeline task unusable.
+                        future.set_exception(e.with_traceback(e.__traceback__.tb_next))
 
                     self.logger().error(
                         f"[PIPELINE] Submission {submission_id} failed after {elapsed_ms:.1f}ms: {e}"
