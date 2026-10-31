@@ -52,6 +52,8 @@ class XRPLAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.resume_test_event = asyncio.Event()
 
         self.connector._lock_delay_seconds = 0
+        # Snapshot requests start the node pool on demand; keep unit tests off the network
+        self.connector._ensure_network_started = AsyncMock()
 
         trading_rule = TradingRule(
             trading_pair=self.trading_pair,
@@ -267,6 +269,55 @@ class XRPLAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         # Verify
         self.assertEqual(result, {"asks": [], "bids": []})
         self.assertEqual(self.mock_query_pool.submit.call_count, 2)
+
+    async def test_request_order_book_snapshot_starts_network_before_querying(self):
+        """Paper trade mode never calls start_network(), so the snapshot request must start the node pool itself."""
+        self.data_source.set_worker_manager(self.mock_worker_manager)
+        self.connector.get_currencies_from_trading_pair = Mock(return_value=(XRP(), XRP()))
+        calls = []
+        self.connector._ensure_network_started = AsyncMock(side_effect=lambda: calls.append("start"))
+        empty = QueryResult(
+            success=True,
+            response=Response(status=ResponseStatus.SUCCESS, result={"offers": []}, id=1, type=ResponseType.RESPONSE),
+            error=None,
+        )
+
+        async def submit(request):
+            calls.append("query")
+            return empty
+
+        self.mock_query_pool.submit = submit
+
+        await self.data_source._request_order_book_snapshot("SOLO-XRP")
+
+        self.assertEqual(["start", "query", "query"], calls)
+
+    async def test_ensure_network_started_starts_pools_once_when_called_concurrently(self):
+        connector = XrplExchange(
+            xrpl_secret_key="",
+            wss_node_urls=["wss://sample.com"],
+            max_request_per_minute=100,
+            trading_pairs=[self.trading_pair],
+            trading_required=False,
+        )
+        node_pool_running = {"value": False}
+
+        async def start_node_pool():
+            await asyncio.sleep(0)
+            node_pool_running["value"] = True
+
+        connector._node_pool = MagicMock()
+        type(connector._node_pool).is_running = property(lambda _: node_pool_running["value"])
+        connector._node_pool.start = AsyncMock(side_effect=start_node_pool)
+        connector._worker_manager = MagicMock()
+        connector._worker_manager.is_running = False
+        connector._worker_manager.start = AsyncMock(
+            side_effect=lambda: setattr(connector._worker_manager, "is_running", True))
+
+        await asyncio.gather(connector._ensure_network_started(), connector._ensure_network_started())
+
+        connector._node_pool.start.assert_awaited_once()
+        connector._worker_manager.start.assert_awaited_once()
 
     async def test_request_order_book_snapshot_without_worker_manager(self):
         """Test that _request_order_book_snapshot raises error without worker manager."""

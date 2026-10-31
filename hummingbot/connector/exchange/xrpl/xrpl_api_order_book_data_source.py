@@ -211,6 +211,9 @@ class XRPLAPIOrderBookDataSource(OrderBookTrackerDataSource):
         if self._worker_manager is None:
             raise RuntimeError("Worker manager not initialized for order book data source")
 
+        # Paper trade mode runs only the order book tracker, so start_network() never starts the node pool
+        await self._connector._ensure_network_started()
+
         query_pool: XRPLQueryWorkerPool = self._worker_manager.get_query_pool()
 
         # Fetch both sides in parallel using query pool

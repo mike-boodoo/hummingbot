@@ -142,6 +142,7 @@ class XrplExchange(ExchangePyBase):
         # Order state locking to prevent concurrent status updates
         self._order_status_locks: Dict[str, asyncio.Lock] = {}
         self._order_status_lock_manager_lock = asyncio.Lock()
+        self._network_start_lock = asyncio.Lock()
 
         # Worker pools (lazy initialization after start_network)
         self._tx_pool: Optional[XRPLTransactionWorkerPool] = None
@@ -277,17 +278,19 @@ class XrplExchange(ExchangePyBase):
         Ensure that the network components (node pool and worker manager) are started.
 
         This is called automatically when _query_xrpl is invoked before start_network,
-        such as during initial connection validation via UserBalances.add_exchange.
+        such as during initial connection validation via UserBalances.add_exchange, and by the
+        order book data source when only the order book tracker runs (paper trade mode).
         It only starts the essential components needed for queries, not the full
         network stack (order book tracker, user stream, etc.).
         """
-        if not self._node_pool.is_running:
-            self.logger().debug("Auto-starting node pool for early query...")
-            await self._node_pool.start()
+        async with self._network_start_lock:
+            if not self._node_pool.is_running:
+                self.logger().debug("Auto-starting node pool for early query...")
+                await self._node_pool.start()
 
-        if not self._worker_manager.is_running:
-            self.logger().debug("Auto-starting worker manager for early query...")
-            await self._worker_manager.start()
+            if not self._worker_manager.is_running:
+                self.logger().debug("Auto-starting worker manager for early query...")
+                await self._worker_manager.start()
 
     async def start_network(self):
         """
