@@ -2,7 +2,7 @@ import asyncio
 import time
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 # XRPL imports
 from xrpl.asyncio.clients import AsyncWebsocketClient
@@ -78,6 +78,11 @@ class XRPLAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
         # Node URL rotation for subscriptions (separate from pool's rotation)
         self._subscription_node_index: int = 0
+
+        # Raw offers from the latest snapshot per pair, keyed by side then (Account, Sequence). Offer changes from
+        # the book subscription are applied to these so the book stays current between network snapshots.
+        self._raw_order_books: Dict[str, Dict[str, Dict[Tuple[str, int], Dict[str, Any]]]] = {}
+        self._snapshot_output: Optional[asyncio.Queue] = None
 
     def set_worker_manager(self, worker_manager: XRPLWorkerPoolManager):
         """
@@ -263,6 +268,7 @@ class XRPLAPIOrderBookDataSource(OrderBookTrackerDataSource):
         :param ev_loop: the event loop the method will run in
         :param output: a queue to add the created snapshot messages
         """
+        self._snapshot_output = output
         while True:
             try:
                 await self._request_order_book_snapshots(output=output)
@@ -276,6 +282,11 @@ class XRPLAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
         snapshot: Dict[str, Any] = await self._request_order_book_snapshot(trading_pair)
         snapshot_timestamp: float = time.time()
+
+        self._raw_order_books[trading_pair] = {
+            side: {(offer["Account"], int(offer["Sequence"])): offer for offer in snapshot.get(side, [])}
+            for side in ("asks", "bids")
+        }
 
         snapshot_msg: OrderBookMessage = XRPLOrderBook.snapshot_message_from_exchange(
             msg=snapshot,
@@ -465,6 +476,8 @@ class XRPLAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     self.logger().debug(f"Received message without transaction or meta: {message}")
                     continue
 
+                self._apply_offer_changes_to_order_book(trading_pair, meta)
+
                 order_book_changes = get_order_book_changes(meta)
                 for account_offer_changes in order_book_changes:
                     for offer_change in account_offer_changes["offer_changes"]:
@@ -499,6 +512,72 @@ class XRPLAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
             except Exception as e:
                 self.logger().exception(f"Error processing order book message: {e}")
+
+    def _apply_offer_changes_to_order_book(self, trading_pair: str, meta: Dict[str, Any]) -> bool:
+        """
+        Apply the Offer nodes a validated transaction created, modified or deleted to the pair's raw order book and
+        publish the rebuilt book as a snapshot, without another BookOffers request.
+
+        Funded amounts of changed offers are not known from the metadata, so those offers fall back to their full
+        TakerGets/TakerPays until the next network snapshot.
+
+        :return: True if the pair's book changed and a snapshot was published
+        """
+        raw_book = self._raw_order_books.get(trading_pair)
+        if raw_book is None or self._snapshot_output is None:
+            return False
+
+        base_currency, quote_currency = self._connector.get_currencies_from_trading_pair(trading_pair)
+        changed = False
+        for affected_node in meta.get("AffectedNodes", []):
+            node_type, node = next(iter(affected_node.items()))
+            if node.get("LedgerEntryType") != "Offer":
+                continue
+            fields = node.get("NewFields") if node_type == "CreatedNode" else node.get("FinalFields")
+            if not fields or "Account" not in fields or "Sequence" not in fields:
+                continue
+            taker_gets, taker_pays = fields.get("TakerGets"), fields.get("TakerPays")
+            if self._amount_matches_currency(taker_gets, base_currency) and \
+                    self._amount_matches_currency(taker_pays, quote_currency):
+                side = "asks"
+            elif self._amount_matches_currency(taker_gets, quote_currency) and \
+                    self._amount_matches_currency(taker_pays, base_currency):
+                side = "bids"
+            else:
+                continue
+
+            key = (fields["Account"], int(fields["Sequence"]))
+            if node_type == "DeletedNode":
+                changed = raw_book[side].pop(key, None) is not None or changed
+            else:
+                raw_book[side][key] = {
+                    "Account": fields["Account"],
+                    "Sequence": fields["Sequence"],
+                    "TakerGets": taker_gets,
+                    "TakerPays": taker_pays,
+                }
+                changed = True
+
+        if changed:
+            timestamp = time.time()
+            snapshot_msg = XRPLOrderBook.snapshot_message_from_exchange(
+                msg={"asks": list(raw_book["asks"].values()), "bids": list(raw_book["bids"].values())},
+                timestamp=timestamp,
+                metadata={"trading_pair": trading_pair},
+            )
+            self._snapshot_output.put_nowait(snapshot_msg)
+            self.last_parsed_order_book_timestamp[trading_pair] = int(timestamp)
+        return changed
+
+    @staticmethod
+    def _amount_matches_currency(amount: Any, currency: Any) -> bool:
+        """Whether a ledger amount (drops string for XRP, dict for issued currencies) is in the given currency."""
+        if amount is None:
+            return False
+        if isinstance(amount, str):
+            return getattr(currency, "issuer", None) is None
+        return amount.get("currency") == getattr(currency, "currency", None) and \
+            amount.get("issuer") == getattr(currency, "issuer", None)
 
     async def listen_for_subscriptions(self):  # type: ignore
         """

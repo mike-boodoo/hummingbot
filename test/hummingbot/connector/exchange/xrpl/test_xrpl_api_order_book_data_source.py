@@ -378,6 +378,84 @@ class XRPLAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
 
         self.assertIn("Network error", str(context.exception))
 
+    SOLO_HEX = "534F4C4F00000000000000000000000000000000"
+    SOLO_ISSUER = "rsoLo2S1kiGeCcn6hCUXVrCpGMWLrRrLZz"
+
+    def _setup_raw_book(self):
+        """SOLO-XRP book with one ask (100 SOLO at 0.5 XRP) and one bid (40 SOLO at 0.4 XRP) from a snapshot."""
+        self.connector.get_currencies_from_trading_pair = Mock(
+            return_value=(IssuedCurrency(currency=self.SOLO_HEX, issuer=self.SOLO_ISSUER), XRP()))
+        solo = {"currency": self.SOLO_HEX, "issuer": self.SOLO_ISSUER}
+        self.data_source._snapshot_output = asyncio.Queue()
+        self.data_source._raw_order_books[self.trading_pair] = {
+            "asks": {("rAsker", 1): {"Account": "rAsker", "Sequence": 1, "TakerGets": {**solo, "value": "100"},
+                                     "TakerPays": "50000000", "taker_gets_funded": {**solo, "value": "60"},
+                                     "taker_pays_funded": "30000000"}},
+            "bids": {("rBidder", 2): {"Account": "rBidder", "Sequence": 2, "TakerGets": "16000000",
+                                      "TakerPays": {**solo, "value": "40"}}},
+        }
+        return solo
+
+    def _published_book(self):
+        msg = self.data_source._snapshot_output.get_nowait()
+        return ([(round(r.price, 6), r.amount) for r in msg.asks], [(round(r.price, 6), r.amount) for r in msg.bids])
+
+    def test_offer_changes_update_book_without_network_snapshot(self):
+        solo = self._setup_raw_book()
+        meta = {"AffectedNodes": [
+            # Ask partly consumed: 100 -> 70 SOLO at the same 0.5 XRP price
+            {"ModifiedNode": {"LedgerEntryType": "Offer", "FinalFields": {
+                "Account": "rAsker", "Sequence": 1, "TakerGets": {**solo, "value": "70"}, "TakerPays": "35000000"}}},
+            # Bid removed
+            {"DeletedNode": {"LedgerEntryType": "Offer", "FinalFields": {
+                "Account": "rBidder", "Sequence": 2, "TakerGets": "16000000", "TakerPays": {**solo, "value": "40"}}}},
+            # New bid: 10 SOLO at 0.45 XRP
+            {"CreatedNode": {"LedgerEntryType": "Offer", "NewFields": {
+                "Account": "rNew", "Sequence": 9, "TakerGets": "4500000", "TakerPays": {**solo, "value": "10"}}}},
+            # Unrelated ledger entry and an offer in another book are ignored
+            {"ModifiedNode": {"LedgerEntryType": "AccountRoot", "FinalFields": {"Account": "rAsker"}}},
+            {"CreatedNode": {"LedgerEntryType": "Offer", "NewFields": {
+                "Account": "rOther", "Sequence": 3, "TakerGets": "1000000",
+                "TakerPays": {"currency": "USD", "issuer": "rIssuer", "value": "1"}}}},
+        ]}
+
+        changed = self.data_source._apply_offer_changes_to_order_book(self.trading_pair, meta)
+
+        self.assertTrue(changed)
+        asks, bids = self._published_book()
+        # The modified ask lost its funded amounts and now shows its full remaining size
+        self.assertEqual([(0.5, 70.0)], asks)
+        self.assertEqual([(0.45, 10.0)], bids)
+        self.assertNotIn(("rOther", 3), self.data_source._raw_order_books[self.trading_pair]["bids"])
+        self.assertIn(self.trading_pair, self.data_source.last_parsed_order_book_timestamp)
+
+    def test_offer_changes_for_other_books_publish_nothing(self):
+        self._setup_raw_book()
+        meta = {"AffectedNodes": [{"CreatedNode": {"LedgerEntryType": "Offer", "NewFields": {
+            "Account": "rOther", "Sequence": 3, "TakerGets": "1000000",
+            "TakerPays": {"currency": "USD", "issuer": "rIssuer", "value": "1"}}}}]}
+
+        self.assertFalse(self.data_source._apply_offer_changes_to_order_book(self.trading_pair, meta))
+        self.assertTrue(self.data_source._snapshot_output.empty())
+
+    def test_offer_changes_before_first_snapshot_are_ignored(self):
+        self.data_source._snapshot_output = asyncio.Queue()
+        meta = {"AffectedNodes": [{"DeletedNode": {"LedgerEntryType": "Offer", "FinalFields": {
+            "Account": "rAsker", "Sequence": 1, "TakerGets": "1", "TakerPays": "1"}}}]}
+
+        self.assertFalse(self.data_source._apply_offer_changes_to_order_book(self.trading_pair, meta))
+        self.assertTrue(self.data_source._snapshot_output.empty())
+
+    async def test_network_snapshot_stores_raw_offers(self):
+        offer = {"Account": "rAsker", "Sequence": 1, "TakerGets": "1000000",
+                 "TakerPays": {"currency": self.SOLO_HEX, "issuer": self.SOLO_ISSUER, "value": "2"}}
+        self.data_source._request_order_book_snapshot = AsyncMock(return_value={"asks": [], "bids": [offer]})
+
+        await self.data_source._order_book_snapshot(self.trading_pair)
+
+        self.assertEqual({("rAsker", 1): offer}, self.data_source._raw_order_books[self.trading_pair]["bids"])
+        self.assertEqual({}, self.data_source._raw_order_books[self.trading_pair]["asks"])
+
     async def test_set_worker_manager(self):
         """Test setting worker manager."""
         self.assertIsNone(self.data_source._worker_manager)
